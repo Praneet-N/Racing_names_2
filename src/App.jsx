@@ -1,58 +1,689 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { Canvas } from 'react-three-fiber';
+import { useState, useEffect, useRef } from "react";
+import * as THREE from "three";
 
-const RacingNames = () => {
-    const [races, setRaces] = useState([]);
-    const [countdown, setCountdown] = useState(10);
-    const [isRacing, setIsRacing] = useState(false);
-    const [winner, setWinner] = useState(null);
+/* ═══════════════════════════════════════
+   CONSTANTS
+═══════════════════════════════════════ */
+const TEAM_COLORS = ["#E8002D","#1E90FF","#FF8000","#00D2BE","#3671C6","#9B0000","#00CF6F","#FFD700"];
+const TOTAL_LAPS  = 7;
+const SEGS        = 200;
+const TW          = 3.0;
+const BSPD        = 0.0026; // base speed
 
-    const startCountdown = () => {
-        setIsRacing(false);
-        setCountdown(10);
-        const countdownInterval = setInterval(() => {
-            setCountdown((prev) => { 
-                if (prev <= 1) {
-                    clearInterval(countdownInterval);
-                    startRace();
-                    return 0;
-                } 
-                return prev - 1;
-            });
-        }, 1000);
-    };
+/* ═══════════════════════════════════════
+   CIRCUIT – CatmullRom closed loop
+═══════════════════════════════════════ */
+function buildCircuit() {
+  // Silverstone-inspired layout
+  const pts = [
+    [ 18,   2], [ 10,   2], [  2,   2],
+    [ -4,   2], [ -9,  -2], [-11,  -8],
+    [-12, -14], [ -9, -18],
+    [ -4, -21], [  2, -20], [  6, -24],
+    [  4, -28], [ -1, -31],
+    [ -6, -34], [-10, -37], [-14, -36],
+    [-18, -32], [-20, -27], [-18, -22],
+    [-15, -17], [-10, -15],
+    [ -5, -13], [  2,  -9], [  8,  -5], [ 14,  -1], [ 18,   2],
+  ].map(([x,z]) => new THREE.Vector3(x, 0, z));
+  return new THREE.CatmullRomCurve3(pts, true, "centripetal", 0.5);
+}
 
-    const startRace = () => {
-        setIsRacing(true);
-        // Simulate race logic
-        const raceResults = simulateRace(races);
-        setWinner(raceResults.winner);
-    };
+/* ═══════════════════════════════════════
+   TRACK RIBBON MESH
+═══════════════════════════════════════ */
+function buildTrackGeo(curve, width, segs) {
+  const v = [], idx = [];
+  for (let i = 0; i <= segs; i++) {
+    const t  = i / segs;
+    const t2 = (i + 1) / segs;
+    const p  = curve.getPointAt(t);
+    const p2 = curve.getPointAt(t2 >= 1 ? 0.999 : t2);
+    const dx = p2.x - p.x, dz = p2.z - p.z;
+    const len = Math.sqrt(dx*dx + dz*dz) || 0.001;
+    const nx = -dz/len, nz = dx/len, hw = width/2;
+    v.push(p.x + nx*hw, 0.01, p.z + nz*hw);
+    v.push(p.x - nx*hw, 0.01, p.z - nz*hw);
+    if (i < segs) {
+      const b = i*2;
+      idx.push(b, b+2, b+1, b+1, b+2, b+3);
+    }
+  }
+  idx.push(segs*2, 0, segs*2+1, segs*2+1, 0, 1);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(v, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
 
-    const simulateRace = (races) => {
-        // Placeholder: Implement race simulation logic here
-        const winner = races[Math.floor(Math.random() * races.length)];
-        return { winner };
-    };
+/* ═══════════════════════════════════════
+   F1 CAR MESH (Bruno Simon flat-shaded)
+═══════════════════════════════════════ */
+function createF1Car(hex) {
+  const grp = new THREE.Group();
+  const col  = new THREE.Color(hex);
+  const dark = new THREE.Color(hex).multiplyScalar(0.55);
+  const fm   = c => new THREE.MeshPhongMaterial({ color: c, flatShading: true });
+  const add  = (geo, mat, px=0, py=0, pz=0, rx=0, ry=0, rz=0, sx=1, sy=1, sz=1) => {
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(px, py, pz);
+    m.rotation.set(rx, ry, rz);
+    m.scale.set(sx, sy, sz);
+    grp.add(m); return m;
+  };
 
-    useEffect(() => {
-        // Fetch or generate race names
-        setRaces(['Racer 1', 'Racer 2', 'Racer 3', 'Racer 4']);
-    }, []);
+  // Body
+  add(new THREE.BoxGeometry(2.1, 0.21, 0.62), fm(col));
+  // Side pods
+  add(new THREE.BoxGeometry(0.95, 0.16, 0.21), fm(col), -0.1,-0.02, 0.42);
+  add(new THREE.BoxGeometry(0.95, 0.16, 0.21), fm(col), -0.1,-0.02,-0.42);
+  // Cockpit
+  add(new THREE.BoxGeometry(0.38, 0.26, 0.34), fm(new THREE.Color(0x080808)), -0.1, 0.22, 0);
+  // Helmet
+  const hel = add(new THREE.SphereGeometry(0.14, 6, 5), fm(new THREE.Color(0xeeeeee)), -0.05, 0.38, 0);
+  hel.scale.set(1, 0.7, 1);
+  // Nose
+  add(new THREE.BoxGeometry(0.58, 0.09, 0.24), fm(dark), 1.24, 0.02, 0);
+  // Front wing
+  add(new THREE.BoxGeometry(0.05, 0.04, 1.1), fm(dark), 1.22,-0.02, 0);
+  add(new THREE.BoxGeometry(0.16,0.10,0.05), fm(dark), 1.17,-0.01, 0.55);
+  add(new THREE.BoxGeometry(0.16,0.10,0.05), fm(dark), 1.17,-0.01,-0.55);
+  // Rear wing
+  add(new THREE.BoxGeometry(0.05, 0.30, 0.78), fm(col),-1.02, 0.27, 0);
+  add(new THREE.BoxGeometry(0.19,0.26,0.04), fm(col),-1.02, 0.27, 0.40);
+  add(new THREE.BoxGeometry(0.19,0.26,0.04), fm(col),-1.02, 0.27,-0.40);
+  // Wheels
+  const wGeo = new THREE.CylinderGeometry(0.19, 0.19, 0.16, 8);
+  const wMat = fm(new THREE.Color(0x161616));
+  for (const [wx,wz] of [[-0.66,0.41],[0.66,0.41],[-0.66,-0.41],[0.66,-0.41]]) {
+    add(wGeo, wMat, wx,-0.09, wz, Math.PI/2, 0, 0);
+  }
+  // Fake shadow disk
+  const shadow = new THREE.Mesh(
+    new THREE.CircleGeometry(1.0, 10),
+    new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.22, depthWrite: false })
+  );
+  shadow.rotation.set(-Math.PI/2, 0, 0);
+  shadow.position.set(0, -0.13, 0);
+  grp.add(shadow);
+  // Exhaust glow
+  const ex = new THREE.PointLight(col, 1.8, 4.0);
+  ex.position.set(-1.1, 0, 0);
+  grp.add(ex);
 
-    return (
-        <div>
-            <h1>Racing Names 2</h1>
-            <div>
-                {isRacing ? <h2>Race in Progress...</h2> : <h2>Countdown: {countdown}</h2>}
-                <button onClick={startCountdown} disabled={isRacing}>Start Race</button>
-                {winner && <h2>Winner: {winner}</h2>}
-            </div>
-            <Canvas>
-                {/* Three.js rendering logic goes here */}
-            </Canvas>
-        </div>
+  return grp;
+}
+
+/* ═══════════════════════════════════════
+   NAME LABEL SPRITE
+═══════════════════════════════════════ */
+function makeLabel(name, hex) {
+  const c = document.createElement("canvas");
+  c.width = 200; c.height = 46;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "rgba(0,0,0,0.88)";
+  ctx.fillRect(0, 0, 200, 46);
+  ctx.fillStyle = hex;
+  ctx.fillRect(0, 0, 4, 46);
+  ctx.fillStyle = "#fff";
+  ctx.font = 'bold 15px "Courier New",monospace';
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(name.length > 12 ? name.slice(0,11)+"…" : name, 103, 23);
+  return new THREE.CanvasTexture(c);
+}
+
+/* ═══════════════════════════════════════
+   CONFETTI
+═══════════════════════════════════════ */
+function Confetti({ color }) {
+  const ps = Array.from({length:50},(_,i)=>({
+    id:i, x:+(Math.random()*100).toFixed(1),
+    delay:+(Math.random()*4).toFixed(2), dur:+(2.4+Math.random()*3).toFixed(2),
+    color: i%3===0 ? color : TEAM_COLORS[i%TEAM_COLORS.length],
+    size: Math.round(6+Math.random()*9), round: Math.random()>.5,
+  }));
+  return (
+    <>
+      <style>{`@keyframes fall{0%{transform:translateY(-20px)rotate(0);opacity:1}100%{transform:translateY(108vh)rotate(560deg);opacity:0}}`}</style>
+      <div style={{position:"fixed",inset:0,pointerEvents:"none",zIndex:300,overflow:"hidden"}}>
+        {ps.map(p=>(
+          <div key={p.id} style={{position:"absolute",left:p.x+"%",top:"-16px",width:p.size+"px",height:p.size+"px",background:p.color,borderRadius:p.round?"50%":"2px",animation:`fall ${p.dur}s ${p.delay}s ease-in infinite`}}/>
+        ))}
+      </div>
+    </>
+  );
+}
+
+/* ═══════════════════════════════════════
+   MAIN COMPONENT
+═══════════════════════════════════════ */
+export default function MeetingGP() {
+  const [screen,      setScreen]      = useState("setup");
+  const [inputs,      setInputs]      = useState(["","",""]);
+  const [raceNames,   setRaceNames]   = useState([]);
+  const [winner,      setWinner]      = useState(null);
+  const [winnerColor, setWinnerColor] = useState("#E8002D");
+  const [countdown,   setCountdown]   = useState(null);
+  const [raceKey,     setRaceKey]     = useState(0);
+  const [standings,   setStandings]   = useState([]);
+  const [curLap,      setCurLap]      = useState(1);
+  const [flashMsg,    setFlashMsg]    = useState(null);
+
+  const mountRef   = useRef(null);
+  const mmRef      = useRef(null);
+  const rafRef     = useRef(null);
+  const doneRef    = useRef(false);
+  const timerRef   = useRef(null);
+  const racersRef  = useRef([]);
+
+  const addInput    = () => inputs.length<8 && setInputs(p=>[...p,""]);
+  const removeInput = i  => inputs.length>2 && setInputs(p=>p.filter((_,j)=>j!==i));
+  const updateInput = (i,v) => setInputs(p=>{const a=[...p]; a[i]=v; return a;});
+
+  const beginCountdown = names => {
+    setRaceNames(names);
+    doneRef.current = false;
+    setWinner(null);
+    setCurLap(1);
+    setStandings(names.map((n,i)=>({name:n,color:TEAM_COLORS[i%TEAM_COLORS.length],gap:"--",lap:1})));
+    setScreen("countdown");
+    if (timerRef.current) clearInterval(timerRef.current);
+    let n=3; setCountdown(n);
+    timerRef.current = setInterval(()=>{
+      n--;
+      if (n<=0) { setCountdown("GO!"); clearInterval(timerRef.current); setTimeout(()=>{setCountdown(null);setRaceKey(k=>k+1);setScreen("race");},750); }
+      else setCountdown(n);
+    },900);
+  };
+
+  const handleStart  = () => { const v=inputs.map(s=>s.trim()).filter(Boolean); if(v.length>=2) beginCountdown(v); };
+  const handleReRace = () => beginCountdown(raceNames);
+  const handleNew    = () => setScreen("setup");
+
+  /* ═══════════════════════════════════════
+     THREE.JS SCENE
+  ═══════════════════════════════════════ */
+  useEffect(()=>{
+    if (screen!=="race" || !mountRef.current || raceNames.length<2) return;
+    const el = mountRef.current;
+    let W = el.clientWidth, H = el.clientHeight;
+    const N = raceNames.length;
+
+    /* Scene */
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x6ba3d6);
+    scene.fog = new THREE.Fog(0x6ba3d6, 55, 130);
+
+    /* Camera */
+    const camera = new THREE.PerspectiveCamera(55, W/H, 0.1, 300);
+
+    /* Renderer */
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(W, H);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.domElement.style.cssText = "position:absolute;top:0;left:0;width:100%;height:100%;display:block;";
+    el.appendChild(renderer.domElement);
+
+    /* Lighting */
+    scene.add(new THREE.AmbientLight(0xffeedd, 2.0));
+    const sun = new THREE.DirectionalLight(0xfff3d0, 3.2);
+    sun.position.set(35, 55, 25);
+    scene.add(sun);
+    const fill = new THREE.DirectionalLight(0xaad4ff, 0.7);
+    fill.position.set(-25, 20, -20);
+    scene.add(fill);
+
+    /* Circuit */
+    const circuit = buildCircuit();
+
+    /* Minimap bounding box */
+    const mmPts = Array.from({length:80},(_,i)=>circuit.getPointAt(i/80));
+    let mnX=Infinity,mxX=-Infinity,mnZ=Infinity,mxZ=-Infinity;
+    mmPts.forEach(p=>{if(p.x<mnX)mnX=p.x;if(p.x>mxX)mxX=p.x;if(p.z<mnZ)mnZ=p.z;if(p.z>mxZ)mxZ=p.z;});
+    const mmS = 100/Math.max(mxX-mnX, mxZ-mnZ);
+    const mmOx = -mnX*mmS+10, mmOz = -mnZ*mmS+10;
+
+    /* Set camera start position */
+    const trackCX = (mnX+mxX)/2, trackCZ = (mnZ+mxZ)/2;
+    const startH  = Math.max(mxX-mnX, mxZ-mnZ) * 1.1 + 14;
+    camera.position.set(trackCX, startH, trackCZ + startH * 0.15);
+    camera.lookAt(new THREE.Vector3(trackCX, 0, trackCZ));
+
+    /* Ground */
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(300,300),
+      new THREE.MeshPhongMaterial({ color:0x4ec56c, flatShading:true })
     );
-};
+    ground.rotation.set(-Math.PI/2,0,0);
+    ground.position.set(6,-0.03,-12);
+    scene.add(ground);
 
-export default RacingNames;
+    /* Track surface */
+    const tGeo  = buildTrackGeo(circuit, TW, SEGS);
+    const tMesh = new THREE.Mesh(tGeo, new THREE.MeshPhongMaterial({color:0x2b2b33,flatShading:true,side:THREE.DoubleSide}));
+    scene.add(tMesh);
+
+    /* RACERS */
+    racersRef.current = raceNames.map((name,i)=>{
+      const hex = TEAM_COLORS[i%TEAM_COLORS.length];
+      const car = createF1Car(hex);
+      scene.add(car);
+
+      const sprite = new THREE.Sprite(new THREE.SpriteMaterial({map:makeLabel(name,hex),transparent:true}));
+      sprite.scale.set(0.9, 0.24, 1);
+      scene.add(sprite);
+
+      return {
+        name, hex, car, sprite,
+        totalT: -i*0.018,
+        lap: 1,
+        baseSpeed: BSPD * (0.78 + Math.random()*0.44),
+        momentum: BSPD,
+        nitro: 0, nitroCD: 0,
+        cornerFactor: 0.82 + Math.random()*0.16,
+        finished: false,
+        racePos: i+1, prevPos: i+1,
+      };
+    });
+
+    /* Camera state */
+    const camCur  = new THREE.Vector3(trackCX, startH, trackCZ + startH * 0.15);
+    const camLook = new THREE.Vector3(trackCX, 0, trackCZ);
+
+    /* Animation loop */
+    let frame=0;
+    let prevSJ="", prevLap=1;
+
+    const animate = ()=>{
+      rafRef.current = requestAnimationFrame(animate);
+      frame++;
+
+      if (!doneRef.current) {
+        /* Update racers */
+        racersRef.current.forEach((r,ri)=>{
+          if (r.finished) return;
+
+          const tCur = ((r.totalT % 1) + 1) % 1;
+          const posCur = circuit.getPointAt(tCur);
+
+          const tPrev = ((tCur - 0.012) + 1) % 1;
+          const tNext = (tCur + 0.012) % 1;
+          const pPrev = circuit.getPointAt(tPrev);
+          const pNext = circuit.getPointAt(tNext);
+          const dxC = pNext.x - pPrev.x, dzC = pNext.z - pPrev.z;
+          const dxP = posCur.x - pPrev.x, dzP = posCur.z - pPrev.z;
+          const curvature = Math.abs(dxC*dzP - dzC*dxP) / (Math.sqrt(dxC*dxC+dzC*dzC)+0.001);
+          const cornerPenalty = 1 - curvature * r.cornerFactor * 3.5;
+
+          const lapFraction = Math.min(r.lap / TOTAL_LAPS, 1);
+          const lapBoost = lapFraction * BSPD * 0.18;
+
+          const wave  = Math.sin(frame*0.04+ri*2.3)*0.0009;
+          const micro = (Math.random()-0.5)*0.0012;
+          const nitroBoost = r.nitro>0 ? BSPD*0.55 : 0;
+          const target = Math.max(BSPD*0.35,
+            r.baseSpeed * Math.max(0.45, cornerPenalty) + wave + micro + nitroBoost + lapBoost
+          );
+
+          const accel = target > r.momentum ? 0.06 : 0.10;
+          r.momentum += (target - r.momentum) * accel;
+          r.momentum = Math.max(BSPD*0.3, r.momentum);
+
+          if (r.nitro>0) r.nitro--;
+          else if (r.nitroCD>0) r.nitroCD--;
+          else if (Math.random()<0.004) {
+            r.nitro  = 22+Math.floor(Math.random()*18);
+            r.nitroCD = 120+Math.floor(Math.random()*120);
+          }
+
+          r.totalT += r.momentum;
+
+          const t   = ((r.totalT % 1) + 1) % 1;
+          const pos = circuit.getPointAt(t);
+          const tAhead = (t + 0.008) % 1;
+          const ahead  = circuit.getPointAt(tAhead);
+          const dx = ahead.x - pos.x;
+          const dz = ahead.z - pos.z;
+          const carAngle = Math.atan2(-dz, dx);
+
+          const tan = circuit.getTangentAt(t);
+          const nx  = -tan.z, nz = tan.x;
+          const side = (ri%2===0 ? 0.28 : -0.28) * (ri<4 ? 1 : -1);
+
+          r.car.position.set(pos.x+nx*side, pos.y+0.32, pos.z+nz*side);
+          r.car.rotation.set(0, carAngle, 0);
+          r.sprite.position.set(pos.x+nx*side, pos.y+1.45, pos.z+nz*side);
+
+          const exL = r.car.children.find(c=>c.type==="PointLight");
+          if (exL) exL.intensity = r.nitro>0 ? 4+Math.sin(frame*0.45)*1.5 : 1.8;
+
+          const newLap = Math.floor(r.totalT)+1;
+          if (newLap>r.lap) r.lap = newLap;
+
+          if (r.totalT>=TOTAL_LAPS && !r.finished) {
+            r.finished = true;
+            if (!doneRef.current) {
+              doneRef.current = true;
+              setTimeout(()=>{ setWinner(r.name); setWinnerColor(r.hex); setScreen("winner"); },2500);
+            }
+          }
+        });
+
+        /* Standings */
+        if (frame%8===0) {
+          const sorted = [...racersRef.current].sort((a,b)=>b.totalT-a.totalT);
+          sorted.forEach((r,i)=>{ r.prevPos=r.racePos; r.racePos=i+1; });
+          const leader = sorted[0];
+          const ns = sorted.map((r,i)=>({
+            name:r.name, color:r.hex,
+            gap: i===0 ? "LEADER" : "+"+((leader.totalT-r.totalT)*1850).toFixed(2)+"s",
+            lap: Math.min(r.lap, TOTAL_LAPS),
+          }));
+          const j = JSON.stringify(ns);
+          if (j!==prevSJ) { prevSJ=j; setStandings(ns); }
+          const ll = Math.min(leader.lap, TOTAL_LAPS);
+          if (ll!==prevLap) { prevLap=ll; setCurLap(ll); }
+        }
+
+        /* Minimap */
+        if (frame%5===0 && mmRef.current) {
+          const mc = mmRef.current.getContext("2d");
+          mc.clearRect(0,0,120,120);
+          mc.fillStyle="#0a0a0a";
+          mc.fillRect(0,0,120,120);
+          mc.beginPath();
+          mmPts.forEach((p,i)=>{ const mx=p.x*mmS+mmOx, mz=p.z*mmS+mmOz; i===0?mc.moveTo(mx,mz):mc.lineTo(mx,mz); });
+          mc.closePath();
+          mc.fillStyle="#222"; mc.fill();
+          mc.strokeStyle="#555"; mc.lineWidth=3; mc.stroke();
+          const sp=mmPts[0]; mc.strokeStyle="#fff"; mc.lineWidth=2;
+          mc.beginPath(); mc.moveTo(sp.x*mmS+mmOx-3,sp.z*mmS+mmOz); mc.lineTo(sp.x*mmS+mmOx+3,sp.z*mmS+mmOz); mc.stroke();
+          racersRef.current.forEach(r=>{
+            const t = ((r.totalT%1)+1)%1;
+            const cp = circuit.getPointAt(t);
+            const mx=cp.x*mmS+mmOx, mz=cp.z*mmS+mmOz;
+            mc.fillStyle=r.hex;
+            mc.beginPath(); mc.arc(mx,mz,3.5,0,Math.PI*2); mc.fill();
+          });
+        }
+
+        let cx=0, cz=0;
+        racersRef.current.forEach(r=>{ cx+=r.car.position.x; cz+=r.car.position.z; });
+        cx /= racersRef.current.length;
+        cz /= racersRef.current.length;
+
+        let spread=0;
+        racersRef.current.forEach(r=>{
+          const dx=r.car.position.x-cx, dz=r.car.position.z-cz;
+          const d=Math.sqrt(dx*dx+dz*dz);
+          if(d>spread) spread=d;
+        });
+        const trackSpan = Math.max(mxX-mnX, mxZ-mnZ);
+        const minH = trackSpan * 0.65 + 10;
+        const targetH = Math.max(minH, spread * 2.2 + 14);
+        const camZTarget = cz + targetH * 0.15;
+
+        camCur.x  += (cx         - camCur.x) * 0.04;
+        camCur.y  += (targetH    - camCur.y) * 0.04;
+        camCur.z  += (camZTarget - camCur.z) * 0.04;
+        camLook.x += (cx - camLook.x) * 0.04;
+        camLook.z += (cz - camLook.z) * 0.04;
+
+        camera.position.set(camCur.x, camCur.y, camCur.z);
+        camera.lookAt(camLook.x, 0, camLook.z);
+      }
+
+      renderer.render(scene, camera);
+    };
+
+    animate();
+
+    const onResize = ()=>{
+      W=el.clientWidth; H=el.clientHeight;
+      camera.aspect=W/H; camera.updateProjectionMatrix(); renderer.setSize(W,H);
+    };
+    window.addEventListener("resize", onResize);
+
+    return ()=>{
+      window.removeEventListener("resize", onResize);
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      scene.traverse(o=>{ if(o.geometry) o.geometry.dispose(); if(o.material){ if(Array.isArray(o.material)) o.material.forEach(m=>m.dispose()); else o.material.dispose(); }});
+      try{ renderer.dispose(); }catch(_){}
+      try{ if(el.contains(renderer.domElement)) el.removeChild(renderer.domElement); }catch(_){}
+    };
+  }, [screen, raceKey]);
+
+  const CSS = `
+    @import url('https://fonts.googleapis.com/css2?family=Titillium+Web:wght@300;400;600;700;900&display=swap');
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+    .inp:focus{outline:none!important;border-color:#E8002D!important;}
+    .sbtn:not(:disabled):hover{opacity:.88;transform:translateY(-1px);}
+    .act:hover{opacity:.82;transform:translateY(-1px);}
+    .act{transition:all .18s;}
+    @keyframes cdPulse{0%,100%{transform:scale(1)}50%{transform:scale(1.07)}}
+    @keyframes wReveal{0%{transform:scale(.45);opacity:0}60%{transform:scale(1.05)}100%{transform:scale(1);opacity:1}}
+    @keyframes tFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
+    @keyframes slideRight{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:translateX(0)}}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
+    .trophy{animation:tFloat 2.2s ease-in-out infinite;display:inline-block;}
+    .wcard{animation:wReveal .7s cubic-bezier(.34,1.56,.64,1) forwards;}
+    .glive{animation:pulse 1.4s ease-in-out infinite;}
+  `;
+
+  const valid = inputs.filter(s=>s.trim()).length;
+
+  if (screen==="setup") return (
+    <div style={{fontFamily:'"Titillium Web",sans-serif',background:"#08080f",minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"24px 16px",color:"#fff",overflowY:"auto"}}>
+      <style>{CSS}</style>
+      <div style={{position:"fixed",inset:0,background:"radial-gradient(ellipse at 50% -5%,rgba(232,0,45,0.14) 0%,transparent 55%)",pointerEvents:"none"}}/>
+      <div style={{width:"100%",maxWidth:"440px",position:"relative",zIndex:1}}>
+        <div style={{textAlign:"center",marginBottom:"44px"}}>
+          <div style={{display:"inline-flex",alignItems:"center",gap:"8px",marginBottom:"14px"}}>
+            <div style={{width:"30px",height:"3px",background:"#E8002D"}}/>
+            <span style={{fontSize:"10px",letterSpacing:"0.5em",color:"#E8002D",fontWeight:700}}>FORMULA MEETING</span>
+            <div style={{width:"30px",height:"3px",background:"#E8002D"}}/>
+          </div>
+          <div style={{fontSize:"clamp(44px,13vw,76px)",fontWeight:900,letterSpacing:"-0.02em",lineHeight:0.88,color:"#fff"}}>GRAND</div>
+          <div style={{fontSize:"clamp(44px,13vw,76px)",fontWeight:900,letterSpacing:"-0.02em",lineHeight:0.88,color:"#E8002D"}}>PRIX</div>
+          <div style={{fontSize:"10px",letterSpacing:"0.35em",color:"#3a3a4a",marginTop:"16px",fontWeight:600}}>WINNER HOSTS THE NEXT MEETING</div>
+        </div>
+
+        <div style={{background:"rgba(255,255,255,.03)",border:"1px solid rgba(255,255,255,.07)",borderRadius:"3px",padding:"22px 20px",marginBottom:"14px"}}>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:"18px"}}>
+            <span style={{fontSize:"9px",letterSpacing:"0.4em",color:"#555",fontWeight:700}}>DRIVER LINEUP</span>
+            <span style={{fontSize:"9px",letterSpacing:"0.2em",color:"#333"}}>{inputs.length}/8</span>
+          </div>
+          {inputs.map((n,i)=>(
+            <div key={i} style={{display:"flex",gap:"8px",marginBottom:"8px",alignItems:"center"}}>
+              <div style={{width:"3px",height:"34px",background:TEAM_COLORS[i%TEAM_COLORS.length],borderRadius:"2px",flexShrink:0}}/>
+              <div style={{fontSize:"10px",color:TEAM_COLORS[i%TEAM_COLORS.length],width:"22px",fontWeight:900,letterSpacing:"0.05em",flexShrink:0}}>P{i+1}</div>
+              <input className="inp" type="text" value={n} onChange={e=>updateInput(i,e.target.value)}
+                onKeyDown={e=>e.key==="Enter"&&i===inputs.length-1&&addInput()}
+                placeholder={`Driver ${i+1}`} maxLength={18}
+                style={{flex:1,background:"rgba(255,255,255,.05)",border:"1px solid rgba(255,255,255,.09)",borderRadius:"2px",padding:"9px 12px",color:"#fff",fontSize:"14px",fontFamily:"inherit",transition:"border-color .2s"}}/>
+              {inputs.length>2&&<button onClick={()=>removeInput(i)} style={{background:"transparent",border:"none",color:"#444",padding:"6px 9px",cursor:"pointer",fontSize:"15px",flexShrink:0}}>×</button>}
+            </div>
+          ))}
+          {inputs.length<8&&<button onClick={addInput} style={{background:"transparent",border:"1px dashed rgba(255,255,255,.1)",borderRadius:"2px",color:"#444",padding:"8px",cursor:"pointer",width:"100%",fontSize:"10px",letterSpacing:"0.22em",marginTop:"6px",fontFamily:"inherit"}}>+ ADD DRIVER</button>}
+        </div>
+
+        <button className="sbtn" onClick={handleStart} disabled={valid<2}
+          style={{background:valid>=2?"#E8002D":"#111",border:"none",borderRadius:"2px",color:valid>=2?"#fff":"#333",padding:"16px",fontSize:"12px",fontWeight:700,letterSpacing:"0.3em",cursor:valid>=2?"pointer":"default",width:"100%",transition:"all .18s",fontFamily:"inherit"}}>
+          {valid>=2?"LIGHTS OUT AND AWAY WE GO ▶":`NEED ${Math.max(0,2-valid)} MORE DRIVER${2-valid!==1?"S":""}`}
+        </button>
+      </div>
+    </div>
+  );
+
+  if (screen==="countdown") return (
+    <div style={{fontFamily:'"Titillium Web",sans-serif',background:"#050508",minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",color:"#fff",overflow:"hidden",padding:"20px"}}>
+      <style>{CSS}</style>
+      <div style={{marginBottom:"52px"}}>
+        <div style={{display:"flex",gap:"18px",justifyContent:"center",marginBottom:"10px"}}>
+          {[1,2,3,4,5].map(l=>(
+            <div key={l} style={{width:"32px",height:"32px",borderRadius:"50%",background:typeof countdown==="number"&&countdown>=l?"#E8002D":(countdown==="GO!"?"transparent":"#1a1a1a"),border:"2px solid #2a2a2a",boxShadow:typeof countdown==="number"&&countdown>=l?"0 0 22px #E8002D, 0 0 44px #E8002D55":"none",transition:"all .2s"}}/>
+          ))}
+        </div>
+        <div style={{fontSize:"9px",letterSpacing:"0.45em",color:"#2a2a2a",textAlign:"center",fontWeight:600}}>RACE START PROCEDURE</div>
+      </div>
+      <div style={{fontSize:countdown==="GO!"?"clamp(60px,18vw,120px)":"clamp(90px,28vw,190px)",fontWeight:900,animation:"cdPulse .85s ease-in-out infinite",color:countdown==="GO!"?"#00D2BE":"#E8002D",fontFamily:"inherit",lineHeight:1,textAlign:"center",textShadow:countdown==="GO!"?"0 0 40px rgba(0,210,190,.8)":"0 0 40px rgba(232,0,45,.7)"}}>
+        {countdown}
+      </div>
+      <div style={{marginTop:"48px",display:"flex",gap:"8px",flexWrap:"wrap",justifyContent:"center",maxWidth:"380px"}}>
+        {raceNames.map((n,i)=>(
+          <div key={i} style={{display:"flex",alignItems:"center",gap:"7px",background:"rgba(255,255,255,.03)",borderRadius:"2px",padding:"5px 12px",border:`1px solid ${TEAM_COLORS[i%TEAM_COLORS.length]}33`}}>
+            <div style={{width:"3px",height:"14px",background:TEAM_COLORS[i%TEAM_COLORS.length],borderRadius:"1px"}}/>
+            <span style={{color:"#aaa",fontSize:"12px",fontWeight:600,letterSpacing:"0.06em"}}>{n}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+
+  if (screen==="race") return (
+    <div style={{fontFamily:'"Titillium Web",sans-serif',width:"100vw",height:"100vh",position:"relative",overflow:"hidden",background:"#050508"}}>
+      <style>{CSS}</style>
+
+      <div ref={mountRef} style={{position:"absolute",inset:0,zIndex:1}}/>
+
+      <div style={{position:"absolute",inset:0,zIndex:20,pointerEvents:"none"}}>
+
+        <div style={{position:"absolute",top:"10px",left:"12px",display:"flex",alignItems:"center",gap:"0"}}>
+          <div style={{background:"#E8002D",padding:"5px 10px",display:"flex",alignItems:"center",gap:"6px"}}>
+            <div className="glive" style={{width:"6px",height:"6px",borderRadius:"50%",background:"#fff"}}/>
+            <span style={{fontSize:"9px",fontWeight:700,letterSpacing:"0.35em",color:"#fff"}}>LIVE</span>
+          </div>
+          <div style={{background:"rgba(0,0,0,.88)",padding:"5px 12px"}}>
+            <span style={{fontSize:"10px",fontWeight:700,letterSpacing:"0.18em",color:"#ccc"}}>MEETING GRAND PRIX</span>
+          </div>
+        </div>
+
+        <div style={{position:"absolute",top:"10px",right:"12px",background:"rgba(0,0,0,.9)",padding:"6px 14px",textAlign:"center",minWidth:"68px"}}>
+          <div style={{fontSize:"8px",letterSpacing:"0.35em",color:"#666",fontWeight:700}}>LAP</div>
+          <div style={{fontSize:"22px",fontWeight:900,color:"#fff",lineHeight:1.1}}>
+            {curLap}<span style={{fontSize:"12px",color:"#555",fontWeight:400}}>/{TOTAL_LAPS}</span>
+          </div>
+        </div>
+
+        <div style={{position:"absolute",top:"72px",right:"12px",width:"188px"}}>
+          {standings.slice(0, Math.min(standings.length, 8)).map((s, i) => (
+            <div key={i} style={{
+              display:"flex", alignItems:"stretch",
+              background: i===0 ? "rgba(8,8,8,0.98)" : "rgba(0,0,0,0.82)",
+              borderLeft:`3px solid ${s.color}`,
+              marginBottom:"2px",
+            }}>
+              <div style={{
+                width:"24px", flexShrink:0,
+                display:"flex", alignItems:"center", justifyContent:"center",
+                background: i===0 ? s.color : "rgba(255,255,255,0.06)",
+                fontSize:"10px", fontWeight:900, color:"#fff",
+              }}>
+                {i+1}
+              </div>
+              <div style={{flex:1, padding:"5px 7px", overflow:"hidden"}}>
+                <div style={{
+                  fontSize: i===0 ? "13px" : "11px",
+                  fontWeight: i===0 ? 900 : 600,
+                  color: i===0 ? "#ffffff" : "#888",
+                  whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
+                }}>{s.name}</div>
+                <div style={{fontSize:"8px", color: i===0 ? "#aaa" : "#444", letterSpacing:"0.08em"}}>LAP {s.lap}</div>
+              </div>
+              <div style={{padding:"5px 7px", display:"flex", alignItems:"center", flexShrink:0}}>
+                <span style={{fontSize:"8px", fontWeight:700, color: i===0 ? "#FFD700" : "#445"}}>{s.gap}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div style={{position:"absolute",bottom:"12px",right:"12px",lineHeight:0}}>
+          <canvas ref={mmRef} width={120} height={120}
+            style={{display:"block",borderRadius:"3px",background:"#0a0a0a"}}/>
+        </div>
+
+      </div>
+    </div>
+  );
+
+  if (screen==="winner") return (
+    <div style={{fontFamily:'"Titillium Web",sans-serif',background:"#000",minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",color:"#fff",overflow:"hidden",position:"relative"}}>
+      <style>{`${CSS}
+        @keyframes wGlow{0%,100%{opacity:0.6}50%{opacity:1}}
+        @keyframes scanDown{0%{transform:translateY(-100%)}100%{transform:translateY(100vh)}}
+        @keyframes nameIn{0%{letter-spacing:0.6em;opacity:0;transform:scale(0.85)}100%{letter-spacing:0.05em;opacity:1;transform:scale(1)}}
+        @keyframes fadeUp{0%{opacity:0;transform:translateY(22px)}100%{opacity:1;transform:translateY(0)}}
+        @keyframes strobe{0%,100%{opacity:1}48%{opacity:1}50%{opacity:0}52%{opacity:1}}
+        .winner-name{animation:nameIn 1s cubic-bezier(0.16,1,0.3,1) 0.3s both;}
+        .winner-sub{animation:fadeUp 0.7s ease 1s both;}
+        .winner-card{animation:fadeUp 0.6s ease 0.1s both;}
+        .scan-line{animation:scanDown 1.8s ease-in-out 0.1s both;}
+      `}</style>
+
+      <Confetti color={winnerColor}/>
+
+      <div style={{position:"fixed",inset:0,background:`radial-gradient(ellipse at 50% 30%, ${winnerColor}33 0%, #000 60%)`,zIndex:0}}/>
+
+      <div className="scan-line" style={{position:"fixed",left:0,right:0,height:"3px",background:`linear-gradient(90deg,transparent,${winnerColor},transparent)`,zIndex:2,top:0}}/>
+
+      <div style={{position:"fixed",top:0,left:0,right:0,height:"5px",background:winnerColor,zIndex:3}}/>
+
+      <div style={{position:"relative",zIndex:10,width:"100%",maxWidth:"560px",padding:"0 24px",display:"flex",flexDirection:"column",alignItems:"center",textAlign:"center"}}>
+
+        <div className="winner-card" style={{display:"flex",alignItems:"center",gap:"10px",marginBottom:"28px"}}>
+          <div style={{height:"1px",width:"40px",background:`${winnerColor}88`}}/>
+          <span style={{fontSize:"9px",letterSpacing:"0.55em",color:winnerColor,fontWeight:700}}>RACE OVER — MEETING HOST CONFIRMED</span>
+          <div style={{height:"1px",width:"40px",background:`${winnerColor}88`}}/>
+        </div>
+
+        <div className="trophy" style={{fontSize:"clamp(60px,16vw,100px)",marginBottom:"16px",filter:`drop-shadow(0 0 30px ${winnerColor})`}}>🏆</div>
+
+        <div className="winner-name" style={{
+          fontSize:"clamp(38px,12vw,80px)",
+          fontWeight:900,
+          letterSpacing:"0.05em",
+          color:"#fff",
+          textShadow:`0 0 40px ${winnerColor}, 0 0 80px ${winnerColor}88`,
+          lineHeight:1,
+          marginBottom:"12px",
+          wordBreak:"break-word",
+        }}>
+          {winner?.toUpperCase()}
+        </div>
+
+        <div className="winner-sub" style={{fontSize:"clamp(10px,2.5vw,13px)",letterSpacing:"0.4em",color:"#888",marginBottom:"36px",fontWeight:600}}>
+          HOSTS THE NEXT MEETING
+        </div>
+
+        <div className="winner-sub" style={{width:"80px",height:"3px",background:winnerColor,marginBottom:"36px",boxShadow:`0 0 16px ${winnerColor}`}}/>
+
+        {standings.length>1&&(
+          <div className="winner-sub" style={{width:"100%",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",padding:"16px",marginBottom:"28px"}}>
+            <div style={{fontSize:"8px",letterSpacing:"0.45em",color:"#444",marginBottom:"12px",fontWeight:700}}>FINAL STANDINGS</div>
+            {standings.slice(0,Math.min(standings.length,6)).map((s,i)=>(
+              <div key={i} style={{display:"flex",alignItems:"center",gap:"10px",padding:"7px 0",borderBottom:"1px solid rgba(255,255,255,0.05)"}}>
+                <div style={{width:"3px",height:"20px",background:s.color,flexShrink:0}}/>
+                <span style={{fontSize:"11px",color:"#555",fontWeight:700,width:"26px"}}>P{i+1}</span>
+                <span style={{fontSize:"13px",color:i===0?"#fff":"#666",fontWeight:i===0?800:400,flex:1,textAlign:"left"}}>{s.name}</span>
+                <span style={{fontSize:"9px",color:i===0?"#FFD700":"#444"}}>{s.gap}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div style={{display:"flex",gap:"10px",width:"100%"}}>
+          <button className="act" onClick={handleReRace} style={{flex:1,background:"rgba(255,255,255,.05)",border:"1px solid rgba(255,255,255,.1)",color:"#666",padding:"14px",fontSize:"10px",fontWeight:700,letterSpacing:"0.22em",cursor:"pointer",fontFamily:"inherit"}}>
+            🔁 RACE AGAIN
+          </button>
+          <button className="act" onClick={handleNew} style={{flex:1,background:winnerColor,border:"none",color:"#fff",padding:"14px",fontSize:"10px",fontWeight:700,letterSpacing:"0.22em",cursor:"pointer",fontFamily:"inherit"}}>
+            ✚ NEW RACE
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
+  return null;
+}
